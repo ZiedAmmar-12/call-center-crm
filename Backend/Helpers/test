@@ -1,0 +1,542 @@
+using System.Text;
+using System.Text.RegularExpressions;
+using CsvHelper;
+using CsvHelper.Configuration;
+using Backend.Entities;
+using Microsoft.Extensions.Logging;
+using OfficeOpenXml;
+using System.Globalization;
+using System.IO.Compression;
+
+namespace Backend.Helpers
+{
+    public class FileValidationResult
+    {
+        public int TotalLines { get; set; }
+        public int ValidContacts { get; set; }
+        public int EmptyRows { get; set; }
+        public int InvalidPhones { get; set; }
+        public int Duplicates { get; set; }
+        public long ProcessingTimeMs { get; set; }
+        public List<string> Errors { get; set; } = new();
+        public List<string> Warnings { get; set; } = new();
+    }
+
+    public static class FileValidationHelper
+    {
+        #region Static Regex (Compiled Once - Performance)
+        
+        private static readonly Regex PhonePatternRegex = new(
+            @"^[\+\d][\d\s\-\(\)\.]{5,}$",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant,
+            TimeSpan.FromSeconds(1));
+        
+        private static readonly Regex CleanPhoneRegex = new(
+            @"[\s\-\(\)\.]",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant,
+            TimeSpan.FromSeconds(1));
+        
+        private static readonly Regex ExtractDigitsRegex = new(
+            @"\d",
+            RegexOptions.Compiled,
+            TimeSpan.FromSeconds(1));
+        
+        #endregion
+
+        #region Multi-language Keywords
+        
+        private static readonly string[] PhoneKeywords = new[]
+        {
+            // English
+            "phone", "telephone", "tel", "mobile", "cell", "cellphone", "phone number", "phone nr",
+            // French (Belgium/France)
+            "téléphone", "telephone", "portable", "gsm", "numéro", "numero", "tél", "mobile",
+            // Dutch (Belgium/Netherlands)
+            "telefoon", "gsm", "mobiel", "nummer", "mobiele", "telefoonnummer",
+            // German
+            "telefon", "mobil", "handy", "nummer",
+            // Spanish
+            "teléfono", "movil", "celular", "numero",
+            // Italian
+            "telefono", "cellulare", "numero",
+            // Generic
+            "contact", "number", "phone"
+        };
+        
+        private static readonly Dictionary<string, string[]> FieldMappings = new()
+        {
+            ["lastname"] = new[] { "lastname", "last name", "family name", "surname", "nom", "familienaam", "nachname", "cognome", "apellido" },
+            ["firstname"] = new[] { "firstname", "first name", "given name", "first", "prénom", "voornaam", "vorname", "nome", "nombre" },
+            ["address"] = new[] { "address", "street", "rue", "straat", "strasse", "via", "calle", "adresse", "adres" },
+            ["postalcode"] = new[] { "postalcode", "postal code", "zip", "zipcode", "code postal", "postcode", "plz", "cap" },
+            ["city"] = new[] { "city", "town", "ville", "stad", "stadt", "città", "ciudad", "gemeente" },
+            ["email"] = new[] { "email", "e-mail", "email address", "courriel", "mail", "e-mailadres" }
+        };
+        
+        #endregion
+
+        #region Main Entry Point
+
+        public static async Task<(FileValidationResult Result, List<SourceFileContact> CleanedContacts)>
+            ValidateContactsInFileAsync(
+                IFormFile file, 
+                string countryCode,
+                ILogger logger = null,
+                Encoding encoding = null)
+        {
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var result = new FileValidationResult();
+            var cleanedContacts = new List<SourceFileContact>();
+            var uniqueContacts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            
+            logger?.LogInformation("Starting file validation: {FileName}, Size: {FileSize} bytes, Country: {CountryCode}", 
+                file?.FileName, file?.Length, countryCode);
+
+            // Process directly from stream - NO TEMP FILE for CSV
+            var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
+            
+            try
+            {
+                if (extension == ".csv")
+                {
+                    (result, cleanedContacts) = await ValidateCsvFromStreamAsync(
+                        file.OpenReadStream(), file.FileName, uniqueContacts, countryCode, logger, encoding);
+                }
+                else if (extension == ".xlsx" || extension == ".xls")
+                {
+                    (result, cleanedContacts) = await ValidateExcelFromStreamAsync(
+                        file.OpenReadStream(), file.FileName, uniqueContacts, countryCode, logger);
+                }
+                else
+                {
+                    result.Errors.Add($"Unsupported file type: {extension}");
+                    logger?.LogWarning("Unsupported file type: {Extension}", extension);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger?.LogError(ex, "Error validating file: {FileName}", file?.FileName);
+                result.Errors.Add($"Processing error: {ex.Message}");
+            }
+            
+            stopwatch.Stop();
+            result.ProcessingTimeMs = stopwatch.ElapsedMilliseconds;
+            
+            logger?.LogInformation("File validation completed: {FileName}, Valid: {ValidContacts}, Invalid: {InvalidPhones}, " +
+                "Duplicates: {Duplicates}, Empty: {EmptyRows}, Time: {ProcessingTimeMs}ms", 
+                file?.FileName, result.ValidContacts, result.InvalidPhones, 
+                result.Duplicates, result.EmptyRows, result.ProcessingTimeMs);
+            
+            return (result, cleanedContacts);
+        }
+        
+        #endregion
+
+        #region CSV Processing (Using CsvHelper - RFC 4180 Compliant)
+
+        private static async Task<(FileValidationResult, List<SourceFileContact>)>
+            ValidateCsvFromStreamAsync(
+                Stream stream, 
+                string fileName,
+                HashSet<string> uniqueContacts, 
+                string countryCode,
+                ILogger logger,
+                Encoding encoding)
+        {
+            var result = new FileValidationResult();
+            var cleanedContacts = new List<SourceFileContact>();
+            
+            // Auto-detect encoding if not specified
+            if (encoding == null)
+            {
+                encoding = DetectEncoding(stream);
+                stream.Seek(0, SeekOrigin.Begin);
+            }
+            
+            using var reader = new StreamReader(stream, encoding, detectEncodingFromByteOrderMarks: true);
+            using var csv = new CsvReader(reader, new CsvConfiguration(CultureInfo.InvariantCulture)
+            {
+                BadDataFound = null, // Skip bad rows gracefully
+                ReadingExceptionOccurred = (ex) => 
+                {
+                    logger?.LogWarning(ex, "Error reading CSV row");
+                    return false; // Continue reading
+                }
+            });
+            
+            // Read headers
+            if (!await csv.ReadAsync())
+            {
+                result.Errors.Add("CSV file is empty");
+                return (result, cleanedContacts);
+            }
+            
+            csv.ReadHeader();
+            var headers = csv.HeaderRecord?.ToList() ?? new List<string>();
+            
+            if (headers.Count == 0)
+            {
+                result.Errors.Add("No headers found in CSV file");
+                return (result, cleanedContacts);
+            }
+            
+            // Build column mappings
+            var phoneColumnIndex = FindPhoneColumnIndex(headers);
+            if (phoneColumnIndex == -1)
+            {
+                result.Errors.Add("No phone column found in CSV file. Expected columns containing: " + string.Join(", ", PhoneKeywords));
+                return (result, cleanedContacts);
+            }
+            
+            var columnMap = BuildColumnMap(headers);
+            
+            int rowNumber = 1; // Header is row 1
+            while (await csv.ReadAsync())
+            {
+                rowNumber++;
+                
+                // Check for empty row
+                bool isEmptyRow = true;
+                for (int i = 0; i < headers.Count; i++)
+                {
+                    if (!string.IsNullOrWhiteSpace(csv.GetField(i)))
+                    {
+                        isEmptyRow = false;
+                        break;
+                    }
+                }
+                
+                if (isEmptyRow)
+                {
+                    result.EmptyRows++;
+                    continue;
+                }
+                
+                result.TotalLines++;
+                
+                // Get phone number from correct column
+                var phoneNumber = csv.GetField(phoneColumnIndex)?.Trim();
+                
+                if (string.IsNullOrWhiteSpace(phoneNumber))
+                {
+                    result.InvalidPhones++;
+                    logger?.LogDebug("Row {RowNumber}: No phone number found", rowNumber);
+                    continue;
+                }
+                
+                // Validate phone
+                var validation = PhoneValidationHelper.ValidatePhone(phoneNumber, countryCode);
+                if (!validation.IsValid)
+                {
+                    result.InvalidPhones++;
+                    logger?.LogDebug("Row {RowNumber}: Invalid phone number '{PhoneNumber}': {Error}", 
+                        rowNumber, phoneNumber, validation.ErrorMessage);
+                    continue;
+                }
+                
+                // Clean phone number
+                var cleaned = CleanPhoneRegex.Replace(phoneNumber, "");
+                
+                // Check duplicates
+                if (uniqueContacts.Contains(cleaned))
+                {
+                    result.Duplicates++;
+                    logger?.LogDebug("Row {RowNumber}: Duplicate phone number '{Cleaned}'", rowNumber, cleaned);
+                    continue;
+                }
+                
+                uniqueContacts.Add(cleaned);
+                
+                // Map row to contact
+                var contact = MapRowToContact(csv, columnMap, headers, cleaned);
+                cleanedContacts.Add(contact);
+                result.ValidContacts++;
+            }
+            
+            return (result, cleanedContacts);
+        }
+        
+        #endregion
+
+        #region Excel Processing (EPPlus)
+
+        private static async Task<(FileValidationResult, List<SourceFileContact>)>
+            ValidateExcelFromStreamAsync(
+                Stream stream, 
+                string fileName,
+                HashSet<string> uniqueContacts, 
+                string countryCode,
+                ILogger logger)
+        {
+            var result = new FileValidationResult();
+            var cleanedContacts = new List<SourceFileContact>();
+            
+            ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
+            
+            try
+            {
+                using var package = new ExcelPackage(stream);
+                var worksheet = package.Workbook.Worksheets[0];
+                var dimension = worksheet.Dimension;
+                
+                if (dimension == null || dimension.Rows < 2)
+                {
+                    result.Errors.Add("Excel file has no data rows");
+                    return (result, cleanedContacts);
+                }
+                
+                // Read headers (first row)
+                var headers = new Dictionary<int, string>();
+                var headerList = new List<string>();
+                for (int col = 1; col <= dimension.Columns; col++)
+                {
+                    var header = worksheet.Cells[1, col]?.Text?.Trim() ?? $"Column{col}";
+                    headers[col] = header;
+                    headerList.Add(header);
+                }
+                
+                // Find phone column
+                var phoneColumnIndex = FindPhoneColumnIndex(headerList);
+                if (phoneColumnIndex == -1)
+                {
+                    result.Errors.Add("No phone column found in Excel file. Expected columns containing: " + string.Join(", ", PhoneKeywords));
+                    return (result, cleanedContacts);
+                }
+                phoneColumnIndex++; // Convert to 1-based index for Excel
+                
+                // Find other column indices
+                var columnIndices = FindAllColumnIndices(headerList);
+                
+                // Process rows
+                for (int row = 2; row <= dimension.Rows; row++)
+                {
+                    // Check for empty row
+                    bool isEmptyRow = true;
+                    for (int col = 1; col <= dimension.Columns; col++)
+                    {
+                        if (!string.IsNullOrWhiteSpace(worksheet.Cells[row, col]?.Text))
+                        {
+                            isEmptyRow = false;
+                            break;
+                        }
+                    }
+                    
+                    if (isEmptyRow)
+                    {
+                        result.EmptyRows++;
+                        continue;
+                    }
+                    
+                    result.TotalLines++;
+                    
+                    // Get phone number
+                    var phoneNumber = worksheet.Cells[row, phoneColumnIndex]?.Text?.Trim();
+                    
+                    if (string.IsNullOrWhiteSpace(phoneNumber))
+                    {
+                        result.InvalidPhones++;
+                        continue;
+                    }
+                    
+                    // Validate phone
+                    var validation = PhoneValidationHelper.ValidatePhone(phoneNumber, countryCode);
+                    if (!validation.IsValid)
+                    {
+                        result.InvalidPhones++;
+                        continue;
+                    }
+                    
+                    // Clean phone
+                    var cleaned = CleanPhoneRegex.Replace(phoneNumber, "");
+                    
+                    // Check duplicate
+                    if (uniqueContacts.Contains(cleaned))
+                    {
+                        result.Duplicates++;
+                        continue;
+                    }
+                    
+                    uniqueContacts.Add(cleaned);
+                    
+                    // Build contact
+                    var contact = new SourceFileContact
+                    {
+                        PhoneNumber = cleaned,
+                        OriginalPhoneNumber = cleaned,
+                        IsValid = true,
+                        CreatedAt = DateTime.UtcNow,
+                        LastName = GetExcelCellValue(worksheet, row, columnIndices.LastNameCol),
+                        FirstName = GetExcelCellValue(worksheet, row, columnIndices.FirstNameCol),
+                        Address = GetExcelCellValue(worksheet, row, columnIndices.AddressCol),
+                        PostalCode = GetExcelCellValue(worksheet, row, columnIndices.PostalCodeCol),
+                        City = GetExcelCellValue(worksheet, row, columnIndices.CityCol),
+                        Email = GetExcelCellValue(worksheet, row, columnIndices.EmailCol)
+                    };
+                    
+                    cleanedContacts.Add(contact);
+                    result.ValidContacts++;
+                }
+            }
+            catch (Exception ex)
+            {
+                logger?.LogError(ex, "Error processing Excel file");
+                result.Errors.Add($"Excel processing error: {ex.Message}");
+            }
+            
+            return (result, cleanedContacts);
+        }
+        
+        #endregion
+
+        #region Helper Methods
+
+        private static Encoding DetectEncoding(Stream stream)
+        {
+            // Try to detect encoding from BOM
+            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+            var encoding = reader.CurrentEncoding;
+            stream.Seek(0, SeekOrigin.Begin);
+            
+            // If not UTF-8, try Windows-1252 (common for European files)
+            if (encoding.CodePage == 65001) // UTF-8
+            {
+                // Check if there are any non-ASCII characters that might indicate Windows-1252
+                var buffer = new byte[1024];
+                var bytesRead = stream.Read(buffer, 0, buffer.Length);
+                stream.Seek(0, SeekOrigin.Begin);
+                
+                for (int i = 0; i < bytesRead; i++)
+                {
+                    // Common Windows-1252 characters: € (0x80), ‘ (0x91), ’ (0x92), “ (0x93), ” (0x94)
+                    if (buffer[i] == 0x80 || buffer[i] == 0x91 || buffer[i] == 0x92 || 
+                        buffer[i] == 0x93 || buffer[i] == 0x94)
+                    {
+                        return Encoding.GetEncoding("windows-1252");
+                    }
+                }
+            }
+            
+            return encoding;
+        }
+        
+        private static int FindPhoneColumnIndex(List<string> headers)
+        {
+            for (int i = 0; i < headers.Count; i++)
+            {
+                var header = headers[i].ToLowerInvariant();
+                if (PhoneKeywords.Any(keyword => header.Contains(keyword)))
+                {
+                    return i;
+                }
+            }
+            return -1;
+        }
+        
+        private static Dictionary<string, int> BuildColumnMap(List<string> headers)
+        {
+            var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < headers.Count; i++)
+            {
+                map[headers[i].Trim().ToLowerInvariant()] = i;
+            }
+            return map;
+        }
+        
+        private static SourceFileContact MapRowToContact(
+            CsvReader csv, 
+            Dictionary<string, int> columnMap, 
+            List<string> headers,
+            string cleanedPhone)
+        {
+            var contact = new SourceFileContact
+            {
+                PhoneNumber = cleanedPhone,
+                OriginalPhoneNumber = cleanedPhone,
+                IsValid = true,
+                CreatedAt = DateTime.UtcNow
+            };
+            
+            // Map fields based on column names
+            foreach (var mapping in FieldMappings)
+            {
+                foreach (var possibleName in mapping.Value)
+                {
+                    if (columnMap.TryGetValue(possibleName, out var index))
+                    {
+                        var value = csv.GetField(index)?.Trim() ?? "";
+                        switch (mapping.Key)
+                        {
+                            case "lastname": contact.LastName = value; break;
+                            case "firstname": contact.FirstName = value; break;
+                            case "address": contact.Address = value; break;
+                            case "postalcode": contact.PostalCode = value; break;
+                            case "city": contact.City = value; break;
+                            case "email": contact.Email = value; break;
+                        }
+                        break; // Found match, break inner loop
+                    }
+                }
+            }
+            
+            return contact;
+        }
+        
+        private static (int LastNameCol, int FirstNameCol, int AddressCol, int PostalCodeCol, int CityCol, int EmailCol)
+            FindAllColumnIndices(List<string> headers)
+        {
+            int lastName = -1, firstName = -1, address = -1, postal = -1, city = -1, email = -1;
+            
+            for (int i = 0; i < headers.Count; i++)
+            {
+                var header = headers[i].ToLowerInvariant();
+                
+                foreach (var mapping in FieldMappings)
+                {
+                    if (mapping.Value.Any(keyword => header.Contains(keyword)))
+                    {
+                        switch (mapping.Key)
+                        {
+                            case "lastname": lastName = i + 1; break;
+                            case "firstname": firstName = i + 1; break;
+                            case "address": address = i + 1; break;
+                            case "postalcode": postal = i + 1; break;
+                            case "city": city = i + 1; break;
+                            case "email": email = i + 1; break;
+                        }
+                        break;
+                    }
+                }
+            }
+            
+            return (lastName, firstName, address, postal, city, email);
+        }
+        
+        private static string GetExcelCellValue(ExcelWorksheet worksheet, int row, int col)
+        {
+            if (col <= 0) return "";
+            return worksheet.Cells[row, col]?.Text?.Trim() ?? "";
+        }
+        
+        #endregion
+
+        #region Public Helper Methods
+
+        public static bool LooksLikePhoneNumber(string input)
+        {
+            if (string.IsNullOrWhiteSpace(input)) return false;
+            return PhonePatternRegex.IsMatch(input);
+        }
+        
+        public static string CleanPhoneNumber(string phoneNumber)
+        {
+            return CleanPhoneRegex.Replace(phoneNumber, "");
+        }
+        
+        public static string ExtractDigits(string input)
+        {
+            return ExtractDigitsRegex.Replace(input, "");
+        }
+        
+        #endregion
+    }
+}

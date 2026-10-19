@@ -1,0 +1,21 @@
+
+  <!DOCTYPE html>
+  <html lang="fr" translate="no">
+    <head>
+      <meta charset="UTF-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <!-- Chrome's page auto-translate rewrites DOM text nodes behind React's
+           back, which desyncs React's virtual DOM from the real DOM and throws
+           "insertBefore ... not a child of this node" on the next re-render
+           (e.g. a loading-spinner icon swap). These two lines disable it for
+           this app so React stays the sole owner of the DOM. -->
+      <meta name="google" content="notranslate" />
+      <title>Interface CRM moderne</title>
+    </head>
+
+    <body>
+      <div id="root" class="notranslate"></div>
+      <script type="module" src="/src/main.tsx"></script>
+    </body>
+  </html>
+  

@@ -1,0 +1,160 @@
+import React, { useState } from 'react';
+import { useNavigate } from 'react-router';
+import { Lock, Eye, EyeOff, CheckCircle } from 'lucide-react';
+import { useAuth } from '../../contexts/AuthContext';
+
+export default function ChangePasswordPage() {
+  const [oldPassword, setOldPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [success, setSuccess] = useState(false);
+  const [error, setError] = useState('');
+  const { changePassword, user } = useAuth();
+  const navigate = useNavigate();
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+
+    if (newPassword.length < 8) {
+      setError('Le nouveau mot de passe doit contenir au moins 8 caractères.');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setError('Les mots de passe ne correspondent pas.');
+      return;
+    }
+    if (oldPassword === newPassword) {
+      setError('Le nouveau mot de passe doit être différent de l\'ancien.');
+      return;
+    }
+
+    setLoading(true);
+    try {
+      await changePassword(oldPassword, newPassword);
+      setSuccess(true);
+    } catch (err: any) {
+      setError(err.response?.data?.message || 'Mot de passe actuel incorrect.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const goToHome = () => {
+    const role = user?.role?.toLowerCase();
+    const type = user?.typeConfirmatrice?.toUpperCase();
+    if (role === 'admin') navigate('/admin/dashboard');
+    else if (role === 'confirmatrice') {
+      if (type === 'CONF2') navigate('/confirmation2/dashboard');
+      else if (type === 'CONFCLIENT') navigate('/confirmation-client/dashboard');
+      else navigate('/confirmation1/dashboard');
+    } else if (role === 'agent') navigate('/agent/dashboard');
+    else if (role === 'qualite') navigate('/qualite/dashboard');
+    else if (role === 'commercial') navigate('/commercial/dashboard');
+    else navigate('/login');
+  };
+
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-primary/10 via-secondary/5 to-accent/10 p-4">
+      <div className="w-full max-w-md">
+        <div className="bg-card rounded-2xl shadow-2xl border border-border overflow-hidden">
+          <div className="bg-gradient-to-r from-primary to-secondary p-8 text-center">
+            <h1 className="text-white text-2xl font-medium">Changer le mot de passe</h1>
+            <p className="text-white/80 text-sm mt-1">
+              {user ? 'Mettez à jour votre mot de passe' : 'Définissez votre nouveau mot de passe'}
+            </p>
+          </div>
+
+          <div className="p-8">
+            {success ? (
+              <div className="text-center space-y-4">
+                <CheckCircle className="w-16 h-16 text-green-500 mx-auto" />
+                <h2 className="text-xl font-semibold text-foreground">Mot de passe modifié !</h2>
+                <p className="text-muted-foreground text-sm">
+                  Votre mot de passe a été changé avec succès.
+                </p>
+                <button
+                  onClick={goToHome}
+                  className="w-full bg-gradient-to-r from-primary to-secondary text-white py-3 rounded-lg hover:opacity-90 transition-opacity"
+                >
+                  Continuer
+                </button>
+              </div>
+            ) : (
+              <form onSubmit={handleSubmit} className="space-y-5">
+                {error && (
+                  <div className="bg-destructive/10 border border-destructive/20 text-destructive px-4 py-3 rounded-lg text-sm">
+                    {error}
+                  </div>
+                )}
+
+                <div className="space-y-2">
+                  <label className="block text-sm text-foreground">Mot de passe actuel</label>
+                  <div className="relative">
+                    <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={oldPassword}
+                      onChange={(e) => setOldPassword(e.target.value)}
+                      className="w-full pl-10 pr-4 py-3 bg-input-background border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring text-foreground"
+                      placeholder="••••••••"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="block text-sm text-foreground">Nouveau mot de passe</label>
+                  <div className="relative">
+                    <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={newPassword}
+                      onChange={(e) => setNewPassword(e.target.value)}
+                      className="w-full pl-10 pr-12 py-3 bg-input-background border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring text-foreground"
+                      placeholder="Minimum 8 caractères"
+                      required
+                      minLength={8}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(!showPassword)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    >
+                      {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="block text-sm text-foreground">Confirmer le mot de passe</label>
+                  <div className="relative">
+                    <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground" />
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={confirmPassword}
+                      onChange={(e) => setConfirmPassword(e.target.value)}
+                      className="w-full pl-10 pr-4 py-3 bg-input-background border border-input rounded-lg focus:outline-none focus:ring-2 focus:ring-ring text-foreground"
+                      placeholder="Répétez le mot de passe"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={loading}
+                  className="w-full bg-gradient-to-r from-primary to-secondary text-white py-3 rounded-lg hover:opacity-90 transition-opacity disabled:opacity-50"
+                >
+                  {loading ? 'Enregistrement...' : 'Changer le mot de passe'}
+                </button>
+              </form>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

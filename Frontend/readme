@@ -1,0 +1,16 @@
+
+  - Added agent presence statuses: Offline, Available, Break, OnCall,
+    WrapUp.
+  - Added presence fields to users: presence_status, presence_changed_at,
+    last_heartbeat_at.
+  - Added API endpoints:
+      - GET /api/Agents/me/presence
+      - PATCH /api/Agents/me/presence
+      - POST /api/Agents/me/heartbeat
+  - Frontend now sends heartbeat every 30 seconds while logged in.
+  - GetNextContactAsync now only gives contacts to Available agents.
+  - Assigning a contact moves the agent to OnCall.
+  - Qualifying a contact moves the agent to WrapUp.
+  - Stale heartbeat marks agents Offline.
+  - Break/Offline/logout now release assigned contacts.
+  - 30-minute untouched assigned contacts are automatically released.

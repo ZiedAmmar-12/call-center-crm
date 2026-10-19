@@ -1,0 +1,35 @@
+# .NET
+bin/
+obj/
+.vs/
+*.user
+appsettings.Development.json
+appsettings.Production.json
+# Node / React
+node_modules/
+build/
+dist/
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+# Données et modèles
+*.log
+*.sql
+*.dump
+*.bak
+*.pkl
+*.joblib
+*.h5
+*.onnx
+*.wav
+*.mp3
+# Divers
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
